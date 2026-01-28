@@ -1,0 +1,205 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Voice STT Test</title>
+  <script src="https://cdn.socket.io/4.7.2/socket.io.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/recordrtc@5.6.2/RecordRTC.min.js"></script>
+  <style>
+    body { font-family: monospace; padding: 20px; background: #1a1a2e; color: #eee; }
+    button { padding: 15px 30px; margin: 5px; font-size: 16px; cursor: pointer; }
+    #record { background: #e94560; color: white; border: none; border-radius: 8px; }
+    #record.recording { background: #4ecca3; }
+    #partial { color: #888; font-style: italic; min-height: 24px; margin: 10px 0; }
+    #log { background: #16213e; padding: 15px; margin-top: 20px; height: 400px; overflow-y: auto; border-radius: 8px; }
+    .committed { color: #4ecca3; }
+    .bot { color: #ffc107; }
+    .error { color: #e94560; }
+    .cancelled { color: #ff9800; }
+  </style>
+</head>
+<body>
+  <h2>🎤 Voice STT Test</h2>
+  <div style="margin-bottom: 15px;">
+    <label for="userId">User ID: </label>
+    <input type="text" id="userId" value="user1" style="padding: 8px; font-size: 14px; border-radius: 4px; border: 1px solid #444; background: #16213e; color: #eee; width: 200px;">
+  </div>
+  <div style="margin-bottom: 15px;">
+    <label for="provider">STT Provider: </label>
+    <select id="provider" style="padding: 8px; font-size: 14px; border-radius: 4px; border: 1px solid #444; background: #16213e; color: #eee; width: 200px;">
+      <option value="deepgram">Deepgram</option>
+      <option value="google">Google</option>
+      <option value="elevenlabs">ElevenLabs</option>
+    </select>
+  </div>
+  <button id="record">Click to Start Recording</button>
+  <button id="cancel" style="background: #ff9800; color: white; border: none; border-radius: 8px; display: none;">Cancel</button>
+  <div id="partial">📝 (partial transcript appears here...)</div>
+  <div id="log"></div>
+
+  <script>
+    const socket = io('https://api.dev2.setel.my/offers/voice');
+    const recordBtn = document.getElementById('record');
+    const cancelBtn = document.getElementById('cancel');
+    const partialDiv = document.getElementById('partial');
+    const logDiv = document.getElementById('log');
+    const providerSelect = document.getElementById('provider');
+    
+    let recorder;
+    let stream;
+    let isRecording = false;
+
+    // Handle provider change - restart session if recording
+    providerSelect.onchange = async () => {
+      if (isRecording) {
+        log(`🔄 Provider changed to ${providerSelect.value}, restarting session...`);
+        await restartSession();
+      }
+    };
+
+    async function restartSession() {
+      // Stop current recording without ending the session cleanly
+      if (recorder) {
+        recorder.stopRecording(() => {
+          if (stream) {
+            stream.getTracks().forEach(track => track.stop());
+          }
+        });
+      }
+      
+      // End current session
+      socket.emit('session:end');
+      
+      // Small delay to ensure cleanup
+      await new Promise(resolve => setTimeout(resolve, 100));
+      
+      // Start new session with new provider
+      await startRecording();
+    }
+
+    const log = (msg, className = '') => {
+      const line = document.createElement('div');
+      line.className = className;
+      line.textContent = `[${new Date().toLocaleTimeString()}] ${msg}`;
+      logDiv.appendChild(line);
+      logDiv.scrollTop = logDiv.scrollHeight;
+    };
+
+    // Socket events
+    socket.on('connect', () => log('✅ Connected to server'));
+    socket.on('disconnect', () => log('❌ Disconnected', 'error'));
+    socket.on('session:started', (d) => log('🎬 Session started: ' + d.session_id));
+    socket.on('session:end', () => log('🔒 Session ended'));
+    socket.on('session:error', (d) => log('❌ Error: ' + d.message, 'error'));
+    
+    // Partial: REPLACE the display (not append)
+    socket.on('transcript:partial', (d) => {
+      partialDiv.textContent = '📝 ' + d.text;
+    });
+    
+    // Committed: Append to log and clear partial
+    socket.on('transcript:committed', (d) => {
+      log('✅ ' + d.text, 'committed');
+      partialDiv.textContent = '📝 (listening...)';
+    });
+    
+    socket.on('conversation:result', (d) => log('🤖 Bot: ' + d.responseMessage, 'bot'));
+
+    recordBtn.onclick = async () => {
+      if (!isRecording) {
+        await startRecording();
+      } else {
+        stopRecording();
+      }
+    };
+
+    cancelBtn.onclick = () => {
+      cancelRecording();
+    };
+
+    async function startRecording() {
+      try {
+        stream = await navigator.mediaDevices.getUserMedia({ 
+          audio: { 
+            sampleRate: 16000,
+            channelCount: 1,
+            echoCancellation: true,
+            noiseSuppression: true
+          } 
+        });
+
+        const userId = document.getElementById('userId').value.trim();
+        const provider = providerSelect.value;
+        socket.emit('session:start', { userId, provider });
+        log(`→ Starting session for user: ${userId} with provider: ${provider}`);
+
+        recorder = new RecordRTC(stream, {
+          type: 'audio',
+          mimeType: 'audio/wav',
+          recorderType: RecordRTC.StereoAudioRecorder,
+          desiredSampRate: 16000,
+          numberOfAudioChannels: 1,
+          bufferSize: 4096,
+          timeSlice: 250, // Send chunks every 250ms
+          ondataavailable: async (blob) => {
+            if (!isRecording) return;
+            
+            // Skip WAV header (44 bytes) to get raw PCM16 data
+            const arrayBuffer = await blob.arrayBuffer();
+            const pcmData = arrayBuffer.slice(44);
+            const base64 = btoa(String.fromCharCode(...new Uint8Array(pcmData)));
+            socket.emit('audio:chunk', base64);
+          }
+        });
+
+        recorder.startRecording();
+        isRecording = true;
+        recordBtn.textContent = '🔴 Recording... Click to Stop';
+        recordBtn.classList.add('recording');
+        cancelBtn.style.display = 'inline-block';
+        partialDiv.textContent = '📝 (listening...)';
+
+      } catch (err) {
+        log('❌ Failed to start recording: ' + err.message, 'error');
+      }
+    }
+
+    function stopRecording() {
+      isRecording = false;
+      
+      if (recorder) {
+        recorder.stopRecording(() => {
+          if (stream) {
+            stream.getTracks().forEach(track => track.stop());
+          }
+        });
+      }
+      
+      socket.emit('session:end');
+      
+      recordBtn.textContent = 'Click to Start Recording';
+      recordBtn.classList.remove('recording');
+      cancelBtn.style.display = 'none';
+      partialDiv.textContent = '📝 (partial transcript appears here...)';
+    }
+
+    function cancelRecording() {
+      isRecording = false;
+      
+      if (recorder) {
+        recorder.stopRecording(() => {
+          if (stream) {
+            stream.getTracks().forEach(track => track.stop());
+          }
+        });
+      }
+      
+      socket.emit('session:end');
+      
+      recordBtn.textContent = 'Click to Start Recording';
+      recordBtn.classList.remove('recording');
+      cancelBtn.style.display = 'none';
+      partialDiv.textContent = '📝 (partial transcript appears here...)';
+    }
+  </script>
+</body>
+</html>
