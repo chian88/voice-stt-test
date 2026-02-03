@@ -37,7 +37,10 @@
   <div id="log"></div>
 
   <script>
-    const socket = io('https://api.dev2.setel.my/offers/voice');
+    const socket = io('https://api.dev2.setel.my/voice', {
+      path: '/api/offers/socket.io',
+      transports: ['websocket', 'polling'],  // Try WebSocket first
+    });
     const recordBtn = document.getElementById('record');
     const cancelBtn = document.getElementById('cancel');
     const partialDiv = document.getElementById('partial');
